@@ -31,7 +31,7 @@ The bottom cover comes off. Under it sits a round control board held down by a b
 My plan was to solder an ESP32-C3 onto this board myself.
 Then I looked closer and saw a familiar silver can: **there was already an Espressif ESP32-C3 module on the board.**
 
-![The board, with the ESP32-C3 module at the bottom](images/04-board-esp32c3.jpg)
+![The control board, labelled: ESP32-C3, MCF8316C motor driver, IR receiver, debug pads](images/04-board-esp32c3.jpg)
 
 The board (silkscreen `Smart_P6`) has:
 
@@ -53,7 +53,7 @@ Right next to the module are six labelled pads: **BOOT, TX, RX, 3V3, GND** (plus
 
 I soldered wires to them and used the USB-serial chip on an ESP32-C6 dev kit as my programmer.
 
-![Wired up to a USB-serial adapter](images/08-wired-for-flashing.jpg)
+![Debug pads wired to an ESP32-C6 dev kit used as a USB-serial adapter](images/08-wired-for-flashing.jpg)
 
 A few things I learned here:
 
