@@ -2,11 +2,11 @@
 
 *By Vishal Tejwani · November 2026*
 
-![The Atomberg Renesa Prime, straight out of the box](images/01-fan-unboxed.jpg)
+![The Atomberg Renesa Halo, straight out of the box](images/01-fan-unboxed.jpg)
 
 I wanted one simple thing: say "Hey Siri, fan to 60%" and have my ceiling fan do it.
 
-The Atomberg Renesa Prime is a great BLDC fan, but it only speaks IR. No Wi-Fi, no app, no Apple Home.
+The Atomberg Renesa Halo is a great BLDC fan, but mine is the IR-remote version. No app, no Apple Home.
 The usual fix is an IR blaster on the wall. I didn't want another gadget pointing at the ceiling.
 I wanted the fan itself to be a smart fan.
 
@@ -35,7 +35,7 @@ Then I looked closer and saw a familiar silver can: **there was already an Espre
 
 The board (silkscreen `Smart_P6`) has:
 
-- **U6:** an Espressif ESP32-C3 module, the brain. Wi-Fi and Bluetooth capable, but in this model it only reads the IR remote.
+- **U6:** an Espressif ESP32-C3 module, the brain. Wi-Fi and Bluetooth capable, but on my IR-remote version nothing uses that.
 - **U5:** a **TI MCF8316C**, a sensorless FOC BLDC motor driver with its own EEPROM.
 - **U7:** the IR receiver, with a ring of 6 LEDs around it for the speed display.
 - A mains power stage on the other side that makes the 24 V rail for the motor.
@@ -172,7 +172,7 @@ Lessons, in one line each:
 4. ROM download mode is a free logic probe on an ESP32.
 5. On a small chip, Bluetooth that you only need once is RAM you need forever.
 
-If you have a Renesa Prime and try this, open an issue and tell me how it went.
+If you have a Renesa Halo and try this, open an issue and tell me how it went.
 
 ---
 

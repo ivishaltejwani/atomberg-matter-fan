@@ -1,4 +1,4 @@
-// Matter firmware for the Atomberg Renesa Prime fan board (ESP32-C3-MINI-1 + MCF8316C).
+// Matter firmware for the Atomberg Renesa Halo fan board (ESP32-C3-MINI-1 + MCF8316C).
 // Matter Fan endpoint (on/off + speed slider), Atomberg IR remote, 6-LED speed indicator.
 // Arduino-ESP32 core 3.x, board "ESP32C3 Dev Module", Partition Scheme "Huge APP",
 // USB CDC On Boot: Disabled, partitions.csv in this folder (two OTA slots). See findings.md.

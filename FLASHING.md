@@ -1,6 +1,6 @@
 # How to upload the firmware
 
-For the ESP32-C3 in the Atomberg Renesa Prime. Ready-built images are in [`firmware/`](firmware/).
+For the ESP32-C3 in the Atomberg Renesa Halo. Ready-built images are in [`firmware/`](firmware/).
 
 | File | Address | Use |
 |---|---|---|

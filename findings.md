@@ -1,4 +1,4 @@
-# Atomberg Renesa Prime – C3 (U6) findings, 2026-10-20
+# Atomberg Renesa Halo – C3 (U6) findings, 2026-10-20
 
 ## Status
 - **Stock firmware was erased by the user and replaced with a blank sketch. No flash backup exists.**
