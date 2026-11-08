@@ -1,6 +1,6 @@
-# Atomberg Renesa Prime: Matter firmware
+# Atomberg Renesa Halo: Matter firmware
 
-Replacement firmware for the ESP32-C3 in the Atomberg Renesa Prime ceiling fan (MCF8316C motor driver).
+Replacement firmware for the ESP32-C3 in the Atomberg Renesa Halo ceiling fan (MCF8316C motor driver).
 Works with Apple Home (or any Matter controller): on/off, speed slider, the original IR remote, the LED ring.
 Hardware notes and everything learned along the way are in [findings.md](findings.md).
 The full build story, with photos: [How I turned my Atomberg fan into a Matter fan](blog/how-i-made-my-atomberg-fan-a-matter-fan.md).
