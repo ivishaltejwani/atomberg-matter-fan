@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fan Dashboard</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #636c76; --line: #e3e6ea;
+    --accent: #2563eb; --ok: #15803d; --warn: #b45309; --bad: #b91c1c; --code: #f1f3f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --card: #171b21; --text: #e6e8eb; --muted: #9aa3ad; --line: #2a3038;
+            --accent: #60a5fa; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --code: #11151a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 18px; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 600; }
+  .pill.ok { color: var(--ok); border: 1px solid var(--ok); }
+  .pill.warn { color: var(--warn); border: 1px solid var(--warn); }
+  .pill.bad { color: var(--bad); border: 1px solid var(--bad); }
+  #drop { margin-top: 12px; border: 2px dashed var(--line); border-radius: 10px; padding: 16px; text-align: center;
+          color: var(--muted); cursor: pointer; }
+  #drop.over { border-color: var(--accent); color: var(--accent); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 7px;
+           padding: 6px 11px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  input[type=text] { flex: 1; min-width: 160px; background: var(--code); color: var(--text); border: 1px solid var(--line);
+                     border-radius: 7px; padding: 7px 10px; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .logcard { margin-top: 14px; }
+  #log { height: 420px; overflow: auto; background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+         padding: 10px; margin: 10px 0 0; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         white-space: pre-wrap; word-break: break-all; }
+  #log .e { color: var(--bad); } #log .o { color: var(--accent); } #log .m { color: var(--muted); }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  #msg { min-height: 1.4em; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fan Dashboard</h1>
+  <div class="sub">Atomberg Matter fan · WiFi dev link · this page is only reachable from this Mac</div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Fan</h2>
+      <dl>
+        <dt>Status</dt><dd id="f-status">–</dd>
+        <dt>Address</dt><dd id="f-ip">–</dd>
+        <dt>Running build</dt><dd id="f-sha">–</dd>
+        <dt>Installed OTA</dt><dd id="f-ota">–</dd>
+        <dt>Uptime</dt><dd id="f-up">–</dd>
+        <dt>Free memory</dt><dd id="f-heap">–</dd>
+      </dl>
+    </section>
+
+    <section class="card">
+      <h2>Firmware offered to the fan</h2>
+      <dl>
+        <dt>Update</dt><dd id="o-state">–</dd>
+        <dt>File</dt><dd id="o-name">–</dd>
+        <dt>Version</dt><dd id="o-ver">–</dd>
+        <dt>Build</dt><dd id="o-sha">–</dd>
+        <dt>Size</dt><dd id="o-size">–</dd>
+      </dl>
+      <div id="drop">Drop a <b>.ino.bin</b> here (Arduino IDE → Sketch → Export Compiled Binary) or click to choose.
+        It is signed on this Mac; the fan installs it within ~30 s.</div>
+      <input id="file" type="file" accept=".bin" hidden>
+      <div id="msg"></div>
+    </section>
+  </div>
+
+  <section class="card logcard">
+    <h2>Commands &amp; log</h2>
+    <div class="row">
+      <button data-cmd="info">info</button>
+      <button data-cmd="matter">matter</button>
+      <button data-cmd="devhost">ota status</button>
+      <button data-cmd="mcf telem">motor telemetry</button>
+      <button data-cmd="telem burst 6">6 s burst</button>
+      <button data-cmd="mcf stop">stop motor</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input id="cmd" type="text" placeholder="command, e.g. mcf read 0x8E" autocomplete="off">
+      <button class="primary" id="send">Send</button>
+      <label class="row" style="gap:4px"><input type="checkbox" id="hidehb" checked> hide heartbeats</label>
+      <label class="row" style="gap:4px"><input type="checkbox" id="follow" checked> follow</label>
+    </div>
+    <div class="note">Over WiFi the fan only accepts read-only commands (and stop). Changing settings, pairing or
+      resetting needs the serial cable or the remote.</div>
+    <pre id="log"></pre>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let offset = -1, lastState = null;
+
+function esc(s) { return s.replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c])); }
+function pill(text, kind) { return `<span class="pill ${kind}">${esc(text)}</span>`; }
+function dur(s) { if (s == null) return "–"; const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60;
+  return h ? `${h} h ${m} min` : m ? `${m} min ${s % 60} s` : `${s} s`; }
+
+async function refreshState() {
+  try {
+    const st = await (await fetch("/api/state")).json();
+    lastState = st;
+    const f = st.fan, o = st.offered;
+    const online = f.age != null && f.age < 25;
+    $("f-status").innerHTML = f.addr ? (online ? pill("online", "ok") : pill(`offline ${Math.round(f.age)} s`, "bad"))
+                                     : pill("not heard yet", "warn");
+    $("f-ip").textContent = f.addr || "–";
+    $("f-sha").textContent = f.sha || "–";
+    $("f-ota").textContent = f.ota != null ? `v${f.ota}` : "–";
+    $("f-up").textContent = dur(f.up);
+    $("f-heap").textContent = f.heap ? `${Math.round(f.heap / 1024)} KB` : "–";
+    if (o.error) {
+      $("o-state").innerHTML = pill(o.error, "bad");
+      ["o-name", "o-ver", "o-sha", "o-size"].forEach(id => $(id).textContent = "–");
+    } else {
+      $("o-name").textContent = o.name;
+      $("o-ver").textContent = `v${o.version}`;
+      $("o-sha").textContent = o.app_sha.slice(0, 8);
+      $("o-size").textContent = `${(o.size / 1048576).toFixed(2)} MB`;
+      const current = f.sha && o.app_sha.startsWith(f.sha);
+      $("o-state").innerHTML = !st.signing ? pill("signing key missing", "bad")
+        : current ? pill("fan is up to date", "ok")
+        : f.ota != null && f.ota >= o.version ? pill("not newer than installed (or rolled back)", "warn")
+        : pill("fan will install it", "warn");
+    }
+  } catch (e) { $("f-status").innerHTML = pill("dashboard server not running", "bad"); }
+}
+
+function renderLines(text) {
+  const hide = $("hidehb").checked;
+  return text.split("\n").filter(l => l && !(hide && / hb sha=/.test(l))).map(l => {
+    const cls = /REJECTED|FAULT|FAILED|refused| E \(/.test(l) ? "e" : /\] > /.test(l) ? "o"
+              : /\] devlink:/.test(l) ? "m" : "";
+    return `<span class="${cls}">${esc(l)}</span>`;
+  }).join("\n");
+}
+
+async function refreshLog() {
+  try {
+    const r = await (await fetch(`/api/log?since=${offset}`)).json();
+    if (r.text) {
+      const log = $("log"), html = renderLines(r.text);
+      if (html) log.insertAdjacentHTML("beforeend", (log.innerHTML ? "\n" : "") + html);
+      while (log.childNodes.length > 6000) log.removeChild(log.firstChild);
+      if ($("follow").checked) log.scrollTop = log.scrollHeight;
+    }
+    offset = r.offset;
+  } catch (e) {}
+}
+
+async function sendCmd(line) {
+  line = line.trim();
+  if (!line) return;
+  await fetch("/api/cmd", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({line})});
+  setTimeout(refreshLog, 300);
+}
+
+async function upload(file) {
+  $("msg").innerHTML = `Uploading ${esc(file.name)}…`;
+  const r = await fetch("/api/upload", {method: "POST", headers: {"X-Filename": file.name}, body: await file.arrayBuffer()});
+  const j = await r.json();
+  $("msg").innerHTML = r.ok ? pill(`signed and offered as v${j.version}`, "ok") : pill(j.error || "upload failed", "bad");
+  refreshState();
+}
+
+document.querySelectorAll("button[data-cmd]").forEach(b => b.onclick = () => sendCmd(b.dataset.cmd));
+$("send").onclick = () => { sendCmd($("cmd").value); $("cmd").value = ""; };
+$("cmd").addEventListener("keydown", e => { if (e.key === "Enter") $("send").click(); });
+$("hidehb").onchange = () => { $("log").innerHTML = ""; offset = -1; refreshLog(); };
+const drop = $("drop");
+drop.onclick = () => $("file").click();
+$("file").onchange = e => e.target.files[0] && upload(e.target.files[0]);
+drop.ondragover = e => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove("over"); e.dataTransfer.files[0] && upload(e.dataTransfer.files[0]); };
+
+refreshState(); refreshLog();
+setInterval(refreshState, 2000);
+setInterval(refreshLog, 1000);
+</script>
+</body>
+</html>
