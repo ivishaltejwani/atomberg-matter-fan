@@ -27,6 +27,16 @@
 #include "esp_bt.h"
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
+#include "esp_heap_caps.h"
+#include "esp_mac.h"
+#include <platform/internal/GenericDeviceInstanceInfoProvider.h>
+#include <platform/ESP32/ESP32Config.h>
+#include <platform/ESP32/ConfigurationManagerImpl.h>
+#include <mdns.h>
+#include "lwip/nd6.h"
+#include "lwip/tcpip.h"
+#include "esp_netif_net_stack.h"
+#include <app/FailSafeContext.h>
 #include "devlink.h"  // OTA + logs + commands over WiFi; defines Log (Serial + network)
 
 // CASE session setup during pairing needs internal RAM; the default 8 KB loop stack is more than loop() uses.
@@ -108,10 +118,15 @@ static bool mcfRead32(uint16_t reg, uint32_t &val) {
 static float motorPct = 0;     // last speed command written to the driver
 static float motorTarget = 0;  // where motorRampTick() is heading
 
+static uint32_t motorWord = 1UL << 31;  // last value written to ALGO_DEBUG1 (what the driver should hold)
+static bool motorWriteOk = true;         // false if that write failed: the guard retries it
+
 static void writeMotor(float pct, bool quiet) {
   pct = constrain(pct, 0.0f, 100.0f);
   uint32_t raw = (uint32_t)(pct / 100.0f * 32767.0f) & 0x7FFF;
-  bool ok = mcfWrite32(MCF_ALGO_DEBUG1, (1UL << 31) | (raw << 16));
+  motorWord = (1UL << 31) | (raw << 16);
+  bool ok = mcfWrite32(MCF_ALGO_DEBUG1, motorWord);
+  motorWriteOk = ok;
   motorPct = pct;
   if (!quiet || !ok) Log.printf("motor %.1f%%%s\n", pct, ok ? "" : " (I2C WRITE FAILED)");
 }
@@ -132,6 +147,29 @@ static void motorRampTick() {
   if (motorTarget <= 0 || motorTarget >= motorPct) return;
   float next = max(motorTarget, motorPct - motorDecelPctPerS(motorPct) * dt);
   writeMotor(next, next != motorTarget);
+}
+
+// Called from loop(): the MCF8316C can reset on its own (supply dip), which clears ALGO_DEBUG1 to 0, so the
+// motor stops while we still think it runs. Once a second, read the speed command back and re-send it if the
+// driver lost it, or if the last write failed. Only re-sends the speed the user already asked for.
+static uint32_t motorRestores = 0;
+static void motorGuardTick() {
+  static uint32_t last = 0;
+  if (millis() - last < 1000) return;
+  last = millis();
+  uint32_t v;
+  if (!mcfRead32(MCF_ALGO_DEBUG1, v)) return;  // driver busy/unpowered: try again next second
+  uint32_t want = motorWord & 0xFFFF0000UL, have = v & 0xFFFF0000UL;
+  if (have == want && motorWriteOk) return;
+  uint32_t status = 0, gf = 0, cf = 0;
+  mcfRead32(0xE4, status);
+  mcfRead32(0xE0, gf);
+  mcfRead32(0xE2, cf);
+  motorRestores++;
+  Log.printf("motor guard: driver holds 0x%08lX, expected 0x%08lX (status=0x%08lX gate=0x%08lX ctrl=0x%08lX), re-sending %.1f%% [#%lu]\n",
+             (unsigned long)v, (unsigned long)want, (unsigned long)status, (unsigned long)gf, (unsigned long)cf,
+             motorPct, (unsigned long)motorRestores);
+  motorWriteOk = mcfWrite32(MCF_ALGO_DEBUG1, motorWord);
 }
 
 // ---- MCF8316C telemetry (read-only): what the motor is actually doing ----
@@ -257,6 +295,33 @@ static void reportFanState(uint8_t pct) {
   }, pct);
 }
 
+static void noteFanState(bool on, uint8_t pct);
+
+// "On" is always FanMode High (3), never the library's FAN_MODE_ON (4). Mode 4 is a deprecated alias that a
+// fan must not report (Matter spec: a write of On becomes High). Apple Home has no mapping for it: its on/off
+// value for the fan came back empty and the tile showed "Unavailable" / "No Response" although speed changes
+// went through (homed log 2026-11-23: "Nil updated value for characteristic", fan reporting FanMode 4).
+// MatterFan::setOnOff()/toggle() write 4, so they are only used here to switch OFF.
+static bool fanSetOn(bool on, bool performUpdate = true) {
+  return Fan.setMode(on ? MatterFan::FAN_MODE_HIGH : MatterFan::FAN_MODE_OFF, performUpdate);
+}
+
+// Called from loop(): whatever still leaves FanMode at 4 (a value stored by older firmware, a controller
+// writing On) is turned into High within a second, and reported.
+static void fanModeTick() {
+  static uint32_t last = 0;
+  if (millis() - last < 1000) return;
+  last = millis();
+  using namespace chip::app::Clusters;
+  uint16_t ep = Fan.getEndPointId();
+  esp_matter::attribute_t *attr = esp_matter::attribute::get(ep, FanControl::Id, FanControl::Attributes::FanMode::Id);
+  esp_matter_attr_val_t val = esp_matter_invalid(NULL);
+  if (!attr || esp_matter::attribute::get_val(attr, &val) != ESP_OK || val.val.u8 != MatterFan::FAN_MODE_ON) return;
+  val.val.u8 = MatterFan::FAN_MODE_HIGH;
+  esp_err_t err = esp_matter::attribute::update(ep, FanControl::Id, FanControl::Attributes::FanMode::Id, &val);
+  Log.printf("fan mode ON(4) -> HIGH(3) (%s)\n", esp_err_to_name(err));
+}
+
 // Single place where Matter state turns into motor + LEDs.
 static bool applyFan(MatterFan::FanMode_t mode, uint8_t percent) {
   bool on = mode != MatterFan::FAN_MODE_OFF && percent > 0;
@@ -266,6 +331,7 @@ static bool applyFan(MatterFan::FanMode_t mode, uint8_t percent) {
   showLeds(on, percent);
   reportFanState(on ? percent : 0);
   Log.printf("fan %s %u%% (mode %s)\n", on ? "ON" : "OFF", percent, Fan.getFanModeString(mode));
+  noteFanState(on, on ? percent : 0);
   return true;
 }
 
@@ -334,7 +400,7 @@ static void handlePowerButton() {
   lastPowerMs = now;
   if (powerBurst == 1) {
     Log.println("remote: power");
-    Fan.toggle();
+    fanSetOn(!Fan.getOnOff());
     return;
   }
   Log.printf("remote: power x%d\n", powerBurst);
@@ -527,6 +593,7 @@ static void printPairingCodes() {
 // ("BIGNUM alloc failed", "PacketBuffer pool EMPTY") and Home shows No Response. BLE is only needed for
 // pairing; a reset reboots with it enabled again.
 static bool bleReleased = false;
+static void heapWatchStart();
 
 static void releaseBle() {
   if (bleReleased) return;
@@ -544,7 +611,41 @@ static void releaseBle() {
     esp_err_t err = esp_bt_mem_release(ESP_BT_MODE_BLE);
     Log.printf("bluetooth released (%s): heap %lu -> %lu\n", esp_err_to_name(err), (unsigned long)before,
                   (unsigned long)ESP.getFreeHeap());
+    heapWatchStart();  // only now: its stack would come out of the RAM that pairing needs
+    devlinkStart();    // same for the dev link (OTA, logs)
   }, before);
+}
+
+// An unpaired fan must not be on WiFi. Bluetooth (needed to pair) and a connected WiFi station together
+// leave ~10 KB of heap instead of ~26 KB, and pairing then fails ("stuck on setting up" in Home). Stale
+// credentials survive whenever the reset that should wipe them is cut short, so drop them at every
+// unpaired boot: the controller sends fresh ones while pairing.
+// By the time we know the fan is unpaired the station is already started and connecting, and its buffers are
+// allocated, so wipe the stored credentials and restart once: the next boot never starts WiFi.
+// Runs on the Matter task, so Matter's own WiFi state machine cannot reconnect in between (done from setup(),
+// esp_wifi_set_config failed with "sta is connecting"). Only the station credentials are wiped; not
+// esp_wifi_restore(), which also resets the stored mode.
+static RTC_NOINIT_ATTR uint32_t wifiCleanups;  // survives the restart below: never loop on it
+static volatile bool restartAfterWifiCleanup = false;
+
+static void dropStaleWifi() {
+  if (esp_reset_reason() != ESP_RST_SW) wifiCleanups = 0;
+  chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+    wifi_config_t cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) != ESP_OK || !cfg.sta.ssid[0]) return;
+    chip::DeviceLayer::ConnectivityMgr().SetWiFiStationMode(chip::DeviceLayer::ConnectivityManager::kWiFiStationMode_Disabled);
+    wifi_config_t empty = {};
+    esp_err_t err = ESP_FAIL;
+    for (int i = 0; i < 5 && err != ESP_OK; i++) {
+      esp_wifi_disconnect();
+      esp_wifi_stop();
+      esp_wifi_set_mode(WIFI_MODE_STA);
+      err = esp_wifi_set_config(WIFI_IF_STA, &empty);
+      if (err != ESP_OK) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    Log.printf("not paired: old WiFi credentials cleared (%s)\n", esp_err_to_name(err));
+    if (err == ESP_OK && wifiCleanups++ < 2) restartAfterWifiCleanup = true;
+  });
 }
 
 // During pairing the phone drops its Bluetooth link once the fan has WiFi credentials, then opens CASE
@@ -571,7 +672,44 @@ static void onMatterEvent(matterEvent_t ev, const chip::DeviceLayer::ChipDeviceE
   }
 }
 
+// The SDK closes the pairing window 15 minutes after boot (CONFIG_CHIP_DISCOVERY_TIMEOUT_SECS) and stops
+// advertising: an unpaired fan on the ceiling then could not be found until someone cut its power. Keep an
+// unpaired fan pairable for as long as it takes. Called from loop().
+static void pairingWindowTick() {
+  static uint32_t last = 0;
+  if (millis() - last < 10000) return;
+  last = millis();
+  if (bleReleased) return;  // paired (or about to reboot back into pairing mode)
+  chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+    auto &server = chip::Server::GetInstance();
+    auto &window = server.GetCommissioningWindowManager();
+    if (server.GetFabricTable().FabricCount() != 0 || window.IsCommissioningWindowOpen()) return;
+    CHIP_ERROR err = window.OpenBasicCommissioningWindow(chip::System::Clock::Seconds32(900),
+                                                         chip::CommissioningWindowAdvertisement::kAllSupported);
+    Log.printf("pairing window reopened (%s)\n", err == CHIP_NO_ERROR ? "ok" : "FAILED");
+  });
+}
+
 // 'matter' command: is a controller actually connected? Read on the Matter task.
+// The SDK makes ReadHandler's state private but befriends this (test-only) class; we never link the real one.
+namespace chip { namespace app { namespace reporting {
+class TestReportScheduler {
+ public:
+  static void Print(ReadHandler *h) {
+    uint16_t minI = 0, maxI = 0;
+    h->GetReportingIntervals(minI, maxI);
+    SubscriptionId id = 0;
+    h->GetSubscriptionId(id);
+    uint64_t peer = h->GetSession() ? h->GetSubjectDescriptor().subject : 0;
+    Log.printf("  %s id=%08lX fabric=%u peer=%08lX%08lX interval=%u..%us %s%s%s\n",
+               h->IsType(ReadHandler::InteractionType::Subscribe) ? "subscription" : "read", (unsigned long)id,
+               h->GetAccessingFabricIndex(), (unsigned long)(peer >> 32), (unsigned long)peer, minI, maxI,
+               h->IsActiveSubscription() ? "established" : "NOT-ESTABLISHED", h->IsPriming() ? " priming" : "",
+               h->IsAwaitingReportResponse() ? " awaiting-ack" : "");
+  }
+};
+}}}
+
 static void printMatterStatus() {
   chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
     auto &server = chip::Server::GetInstance();
@@ -591,15 +729,249 @@ static void printMatterStatus() {
       return chip::Loop::Continue;
     });
     auto *im = chip::app::InteractionModelEngine::GetInstance();
+    for (unsigned i = 0; i < im->GetNumActiveReadHandlers(); i++)
+      if (auto *h = im->ActiveHandlerAt(i)) chip::app::reporting::TestReportScheduler::Print(h);
     Log.printf("matter: fabrics=%u sessions=%d (case=%d) subscriptions=%lu reads=%lu\n",
                   server.GetFabricTable().FabricCount(), secure, caseSessions,
                   (unsigned long)im->GetNumActiveReadHandlers(chip::app::ReadHandler::InteractionType::Subscribe),
                   (unsigned long)im->GetNumActiveReadHandlers(chip::app::ReadHandler::InteractionType::Read));
   });
   esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-  esp_ip6_addr_t ip6[4];
+  esp_ip6_addr_t ip6[CONFIG_LWIP_IPV6_NUM_ADDRESSES];  // esp_netif_get_all_ip6 can return that many
   int n = sta ? esp_netif_get_all_ip6(sta, ip6) : 0;
   for (int i = 0; i < n; i++) Log.printf("ipv6: " IPV6STR "\n", IPV62STR(ip6[i]));
+}
+
+// ---- heap diagnostics: catch the short dips that break CASE / subscription priming ----
+struct AllocFail { uint32_t ms, size, caps, freeNow; char task[12]; };
+static AllocFail allocFails[16];
+static volatile uint32_t allocFailCount = 0;
+static uint32_t allocFailLogged = 0;
+
+static void onAllocFail(size_t size, uint32_t caps, const char *) {
+  AllocFail &f = allocFails[allocFailCount % 16];
+  f.ms = millis(); f.size = size; f.caps = caps; f.freeNow = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  const char *t = pcTaskGetName(nullptr);
+  strncpy(f.task, t ? t : "?", sizeof f.task - 1);
+  f.task[sizeof f.task - 1] = 0;
+  allocFailCount++;
+}
+
+static const uint32_t HEAP_DIP = 30000;
+static volatile bool dipActive = false, dipReady = false;
+static volatile uint32_t dipStart = 0, dipEnd = 0, dipMin = 0, dipLargest = 0;
+static uint32_t dipCount = 0;
+
+static void heapWatchTask(void *) {
+  for (;;) {
+    uint32_t f = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    if (f < HEAP_DIP) {
+      if (!dipActive) { dipActive = true; dipStart = millis(); dipMin = UINT32_MAX; }
+      if (f < dipMin) { dipMin = f; dipLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT); }
+    } else if (dipActive && !dipReady) {
+      dipActive = false; dipEnd = millis(); dipReady = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+static void heapDiagBegin() {
+  heap_caps_register_failed_alloc_callback(onAllocFail);
+}
+
+static void heapWatchStart() {  // called once Bluetooth is released (see releaseBle)
+  static bool started = false;
+  if (started) return;
+  started = true;
+  xTaskCreate(heapWatchTask, "heapwatch", 2048, nullptr, 10, nullptr);
+}
+
+static void heapDiagTick() {  // from loop(): logging is not safe inside the hooks
+  while (allocFailLogged < allocFailCount) {
+    if (allocFailCount - allocFailLogged > 16) allocFailLogged = allocFailCount - 16;
+    const AllocFail &f = allocFails[allocFailLogged % 16];
+    Log.printf("ALLOC FAILED: %lu bytes caps=0x%lx task=%s free=%lu at up=%lus\n", (unsigned long)f.size,
+               (unsigned long)f.caps, f.task, (unsigned long)f.freeNow, (unsigned long)(f.ms / 1000));
+    allocFailLogged++;
+  }
+  if (dipReady) {
+    dipCount++;
+    Log.printf("heap dip #%lu: min free %lu (largest block %lu) for %lu ms at up=%lus\n", (unsigned long)dipCount,
+               (unsigned long)dipMin, (unsigned long)dipLargest, (unsigned long)(dipEnd - dipStart),
+               (unsigned long)(dipStart / 1000));
+    dipReady = false;
+  }
+}
+
+// ---- WiFi: mains powered, so never power-save ----
+// In modem sleep the radio only wakes for DTIM beacons and misses multicast: mDNS queries and IPv6
+// neighbour solicitations from the HomePod. The fan then can't resolve the hub, and the hub can't reach
+// the fan or keeps flipping it between reachable and unreachable. Matter can re-enable power save when
+// WiFi reconnects, so check every few seconds and keep it off.
+static void wifiPowerTick() {
+  static uint32_t last = 0;
+  static bool logged = false;
+  if (millis() - last < 3000) return;
+  last = millis();
+  // Never while Bluetooth is up (pairing): WiFi/BLE share one radio and coexistence needs modem sleep.
+  // With power save off, WiFi starves BLE as soon as it starts connecting and the phone reports
+  // "Unable to pair". Only after pairing has released BLE is it safe to keep the radio awake.
+  if (!bleReleased || esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_IDLE) return;
+  wifi_ps_type_t ps;
+  if (esp_wifi_get_ps(&ps) != ESP_OK || ps == WIFI_PS_NONE) return;
+  esp_err_t err = esp_wifi_set_ps(WIFI_PS_NONE);
+  if (!logged || err != ESP_OK) Log.printf("wifi: power save %d -> off (%s)\n", (int)ps, esp_err_to_name(err));
+  logged = true;
+}
+
+// ---- IPv6: ask for the network prefix instead of waiting for it ----
+// Apple's hubs talk Matter over the routable IPv6 address (the fd.. prefix a HomePod / border router announces).
+// The router only announces it every several minutes, and the solicitation lwIP sends at link-up gets no
+// answer here, so after every power-up the fan sat with a link-local address only and Home showed
+// "No Response" until the next periodic announcement (measured: 4 and 8 minutes). Solicit until one arrives.
+static void routerSolicitTick() {
+  static uint32_t last = 0, tries = 0;
+  static bool had = false;
+  if (millis() - last < (tries < 24 ? 5000u : 60000u)) return;
+  last = millis();
+  esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  wifi_ap_record_t ap;
+  if (!sta || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) { tries = 0; had = false; return; }
+  esp_ip6_addr_t a[CONFIG_LWIP_IPV6_NUM_ADDRESSES];
+  int n = esp_netif_get_all_ip6(sta, a);
+  bool routable = false;
+  for (int i = 0; i < n; i++) routable |= esp_netif_ip6_get_addr_type(&a[i]) != ESP_IP6_ADDR_IS_LINK_LOCAL;
+  if (routable) {
+    if (!had) Log.printf("ipv6: routable address at up=%lus after %lu solicitation(s)\n", millis() / 1000, (unsigned long)tries);
+    had = true;
+    tries = 0;
+    return;
+  }
+  had = false;
+  tries++;
+  tcpip_callback([](void *arg) { nd6_restart_netif((struct netif *)arg); }, esp_netif_get_netif_impl(sta));
+}
+
+// ---- Matter over IPv6 only ----
+// The fan also has an IPv4 address (DHCP; the dev link uses it), and mDNS advertised it. Apple's hub then
+// sometimes picked IPv4, and on this network the fan cannot resolve the hub's MAC by ARP: replies queued,
+// SendMessage failed with lwIP ERR_MEM for 30+ s, CASE and subscriptions timed out and Home showed
+// "No Response" (log 2026-11-16 15:15). Over IPv6 the same hub connects and stays connected. Matter only
+// requires IPv6, so keep IPv4 out of mDNS: controllers then never try it. mdns re-enables IPv4 on every
+// DHCP event, hence the repeat.
+static void mdnsIpv6OnlyTick() {
+  static uint32_t last = 0;
+  static bool logged = false;
+  if (millis() - last < 10000) return;
+  last = millis();
+  esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  wifi_ap_record_t ap;
+  if (!sta || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;
+  esp_err_t err = mdns_netif_action(sta, MDNS_EVENT_DISABLE_IP4);
+  if (!logged || err != ESP_OK) Log.printf("mdns: IPv4 hidden, Matter is advertised over IPv6 only (%s)\n", esp_err_to_name(err));
+  logged = true;
+}
+
+// ---- fan state survives reboots and power cuts (NVS "fanstate"), like the stock fan ----
+static bool savedOn = false;
+static uint8_t savedPct = 0;
+static uint32_t stateChangedAt = 0;
+static bool statePending = false;
+
+static void noteFanState(bool on, uint8_t pct) {
+  if (on == savedOn && pct == savedPct) { statePending = false; return; }
+  statePending = true;
+  stateChangedAt = millis();
+}
+
+static void fanStateTick() {  // write 10 s after the last change, to spare the flash while someone slides
+  if (!statePending || millis() - stateChangedAt < 10000) return;
+  statePending = false;
+  bool on = Fan.getOnOff();
+  uint8_t pct = Fan.getSpeedPercent();
+  nvs_handle_t h;
+  if (nvs_open("fanstate", NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_u8(h, "on", on);
+  nvs_set_u8(h, "pct", pct);
+  nvs_commit(h);
+  nvs_close(h);
+  savedOn = on;
+  savedPct = pct;
+}
+
+static void restoreFanState() {
+  nvs_handle_t h;
+  uint8_t on = 0, pct = 0;
+  if (nvs_open("fanstate", NVS_READONLY, &h) == ESP_OK) {
+    nvs_get_u8(h, "on", &on);
+    nvs_get_u8(h, "pct", &pct);
+    nvs_close(h);
+  }
+  savedOn = on;
+  savedPct = pct;
+  if (!on || !pct) return;
+  Log.printf("restoring fan state: ON %u%%\n", pct);
+  Fan.setSpeedPercent(pct);
+  fanSetOn(true);
+  applyFan(MatterFan::FAN_MODE_HIGH, pct);  // in case the setters did not run the change callback
+}
+
+// ---- device identity shown in Home (Basic Information) ----
+// Names, serial and versions are free text. Vendor/product ID stay the test IDs (0xFFF1/0x8000): they must
+// match the device attestation certificate, and a mismatch makes every controller refuse to pair.
+class FanInstanceInfo
+    : public chip::DeviceLayer::Internal::GenericDeviceInstanceInfoProvider<chip::DeviceLayer::Internal::ESP32Config> {
+ public:
+  FanInstanceInfo()
+      : GenericDeviceInstanceInfoProvider(
+            static_cast<chip::DeviceLayer::Internal::GenericConfigurationManagerImpl<chip::DeviceLayer::Internal::ESP32Config> &>(
+                chip::DeviceLayer::ConfigurationManagerImpl::GetDefaultInstance())) {}
+  CHIP_ERROR GetVendorName(char *buf, size_t n) override { return put(buf, n, "Atomberg"); }
+  CHIP_ERROR GetProductName(char *buf, size_t n) override { return put(buf, n, "Renesa Prime Ceiling Fan"); }
+  CHIP_ERROR GetProductLabel(char *buf, size_t n) override { return put(buf, n, "Renesa Prime"); }
+  CHIP_ERROR GetPartNumber(char *buf, size_t n) override { return put(buf, n, "RENESA-PRIME-MATTER"); }
+  CHIP_ERROR GetProductURL(char *buf, size_t n) override { return put(buf, n, ""); }
+  CHIP_ERROR GetHardwareVersionString(char *buf, size_t n) override { return put(buf, n, "ESP32-C3 + MCF8316C"); }
+  CHIP_ERROR GetHardwareVersion(uint16_t &v) override { v = 1; return CHIP_NO_ERROR; }
+  CHIP_ERROR GetSerialNumber(char *buf, size_t n) override {  // unique per fan: the WiFi MAC
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (n < 13) return CHIP_ERROR_BUFFER_TOO_SMALL;
+    snprintf(buf, n, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return CHIP_NO_ERROR;
+  }
+
+ private:
+  static CHIP_ERROR put(char *buf, size_t n, const char *v) {
+    if (strlen(v) + 1 > n) return CHIP_ERROR_BUFFER_TOO_SMALL;
+    strcpy(buf, v);
+    return CHIP_NO_ERROR;
+  }
+};
+static FanInstanceInfo fanInstanceInfo;
+
+// Apple Home builds every accessory's information page (Manufacturer, Model, Serial Number, Firmware) from
+// Basic Information, and treats a missing Serial Number as a failed read: the tile shows "No Response" even
+// though commands go through (seen 2026-11-16: speed changes worked, Home said No Response, and homed logged
+// "could not find cached attribute values for ... BasicInformation SerialNumber"). SerialNumber is optional
+// in Matter, so the Arduino node leaves it out and the fan answered UNSUPPORTED_ATTRIBUTE. Add it before
+// Matter starts; its value is served by fanInstanceInfo (the WiFi MAC), the stored copy matches.
+static void addSerialNumberAttribute() {
+  using namespace esp_matter;
+  node_t *node = node::get();
+  endpoint_t *root = node ? endpoint::get(node, 0) : nullptr;
+  cluster_t *info = root ? cluster::get(root, chip::app::Clusters::BasicInformation::Id) : nullptr;
+  if (!info) {
+    Log.println("serial number: Basic Information cluster not found");
+    return;
+  }
+  if (attribute::get(info, chip::app::Clusters::BasicInformation::Attributes::SerialNumber::Id)) return;
+  static char serial[13];
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(serial, sizeof serial, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  attribute_t *a = cluster::basic_information::attribute::create_serial_number(info, serial, strlen(serial));
+  Log.printf("serial number attribute %s (%s)\n", a ? "added" : "FAILED", serial);
 }
 
 // ---- serial terminal (also used by tools/c3flash.py, fanterm.py and matter_creds.py) ----
@@ -617,11 +989,11 @@ static void handleLine(String cmd) {
     if (sta) esp_netif_get_ip_info(sta, &ip);
     wifi_ap_record_t ap = {};
     bool linked = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
-    Log.printf("wifi=%s ssid=%s rssi=%d ip=" IPSTR " commissioned=%d fan=%s %u%% motor=%.1f%% (target %.1f%%) heap=%u min_heap=%u\n",
+    Log.printf("wifi=%s ssid=%s rssi=%d ip=" IPSTR " commissioned=%d fan=%s %u%% motor=%.1f%% (target %.1f%%) heap=%u min_heap=%u motor_restores=%lu wifi_ps=%d\n",
                   linked ? "up" : "down", linked ? (const char *)ap.ssid : "-", linked ? ap.rssi : 0, IP2STR(&ip.ip),
                   Matter.isDeviceCommissioned(),
                   Fan.getOnOff() ? "ON" : "OFF", Fan.getSpeedPercent(), motorPct, motorTarget,
-                  ESP.getFreeHeap(), ESP.getMinFreeHeap());
+                  ESP.getFreeHeap(), ESP.getMinFreeHeap(), (unsigned long)motorRestores, ({ wifi_ps_type_t ps = WIFI_PS_NONE; esp_wifi_get_ps(&ps); (int)ps; }));
   } else if (cmd == "devhost" || cmd.startsWith("devhost ")) {
     devHostCommand(cmd.length() > 8 ? cmd.substring(8) : String());
   } else if (cmd == "matter") {
@@ -683,11 +1055,16 @@ void setup() {
   for (uint8_t p : ROWS) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
   for (uint8_t p : COLS) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
 
+  heapDiagBegin();
   i2cLock = xSemaphoreCreateMutex();
   Wire.begin(MCF_SDA, MCF_SCL, 100000);
   Wire.setTimeOut(50);
   setMotor(0);  // never start spinning on boot
   devlinkBegin([] { setMotor(0); });  // OTA stops the motor before flashing
+  // No update while pairing is still in progress: the reboot would drop the half-finished pairing.
+  devUpdateAllowed = [] {
+    return Matter.isDeviceCommissioned() && !chip::Server::GetInstance().GetFailSafeContext().IsFailSafeArmed();
+  };
 
   const esp_timer_create_args_t ledTimerArgs = {.callback = ledTick, .name = "led"};
   esp_timer_handle_t ledTimer;
@@ -702,7 +1079,7 @@ void setup() {
   // Keep on/off and speed consistent, as in the MatterFan example.
   Fan.onChangeSpeedPercent([](uint8_t pct) {
     if (pct == MatterFan::OFF_SPEED && Fan.getMode() != MatterFan::FAN_MODE_OFF) return Fan.setOnOff(false, Fan.ATTR_SET);
-    if (pct > MatterFan::OFF_SPEED && Fan.getMode() == MatterFan::FAN_MODE_OFF) return Fan.setOnOff(true, Fan.ATTR_SET);
+    if (pct > MatterFan::OFF_SPEED && Fan.getMode() == MatterFan::FAN_MODE_OFF) return fanSetOn(true, Fan.ATTR_SET);
     return true;
   });
   Fan.onChangeMode([](MatterFan::FanMode_t mode) {
@@ -711,16 +1088,20 @@ void setup() {
     return true;
   });
   Fan.onChange(applyFan);
+  addSerialNumberAttribute();  // the node exists once the fan endpoint does; Matter starts below
 
   ensureFactoryData();
   Matter.onEvent(onMatterEvent);
   Matter.begin();
+  chip::DeviceLayer::SetDeviceInstanceInfoProvider(&fanInstanceInfo);  // read at pairing + on every read
   if (!Matter.isDeviceCommissioned()) {
+    dropStaleWifi();
     Log.println("\natomberg_matter: not commissioned, pair over Bluetooth");
     printPairingCodes();
   } else {
     Fan.updateAccessory();  // restore last state from Matter storage
     releaseBle();
+    restoreFanState();
   }
   Log.printf("heap after Matter start: %u\n", ESP.getFreeHeap());
 }
@@ -746,7 +1127,16 @@ void loop() {
     pairedAt = 0;
     releaseBle();
   }
-  if (rebootForBle) {
+  // Not at once: a factory reset (decommission, removal from Home) wipes pairing data and WiFi credentials
+  // on the Matter task and then restarts by itself. Restarting under it left the WiFi credentials behind.
+  static uint32_t rebootForBleAt = 0;
+  if (restartAfterWifiCleanup) {
+    Log.println("restarting clean for pairing");
+    delay(200);
+    ESP.restart();
+  }
+  if (rebootForBle && !rebootForBleAt) rebootForBleAt = millis() | 1;
+  if (rebootForBleAt && millis() - rebootForBleAt > 5000) {
     Log.println("not paired and bluetooth is off: rebooting to advertise again");
     delay(200);
     ESP.restart();
@@ -762,7 +1152,15 @@ void loop() {
   }
   devPollCommands(handleNetworkLine);
   motorRampTick();
+  motorGuardTick();
   telemetryTick();
+  heapDiagTick();
+  fanStateTick();
+  fanModeTick();
+  wifiPowerTick();
+  pairingWindowTick();
+  routerSolicitTick();
+  mdnsIpv6OnlyTick();
   checkPowerBurstTimeout();
   delay(10);
 }

@@ -162,7 +162,7 @@ def log_line(text):
 HB = re.compile(r"hb sha=(\w+) up=(\d+)s heap=(\d+)(?: ota=v(\d+))?")
 
 
-def serve(bin_path, legacy):
+def serve(bin_path, legacy, bind="0.0.0.0"):
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     key = load_key() if os.path.exists(KEY) else None
     if not key:
@@ -171,7 +171,7 @@ def serve(bin_path, legacy):
     fan = {"addr": None, "seen": 0, "sha": None, "up": None, "heap": None, "ota": None}
 
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.bind(("0.0.0.0", LOG_PORT))
+    udp.bind((bind, LOG_PORT))  # the fan only takes commands from its devhost IP
 
     def send_to_fan(line):
         if not fan["addr"]:
@@ -360,6 +360,7 @@ if __name__ == "__main__":
     p = sub.add_parser("serve")
     p.add_argument("--bin", help="always offer this file instead of the newest build/upload")
     p.add_argument("--legacy", action="store_true")
+    p.add_argument("--bind", default="0.0.0.0", help="local IP for the log/command socket; use the fan's devhost IP when this computer has several")
     p = sub.add_parser("send")
     p.add_argument("lines", nargs="+")
     p.add_argument("--listen", type=float, default=3)
@@ -368,7 +369,7 @@ if __name__ == "__main__":
     if a.cmd == "keygen":
         keygen(a.force)
     elif a.cmd == "serve":
-        serve(a.bin, a.legacy)
+        serve(a.bin, a.legacy, a.bind)
     elif a.cmd == "send":
         send(a.lines, a.listen)
     else:
