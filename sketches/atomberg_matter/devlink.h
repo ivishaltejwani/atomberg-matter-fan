@@ -54,13 +54,14 @@ static void devSend(const char *buf, size_t len) {
 
 // Log text is only buffered here; devTask sends it. Logs can come from the WiFi/lwIP tasks themselves,
 // and calling sendto() from those could deadlock.
-static char devRing[2048];
+static const size_t DEV_RING = 2048;
+static char *devRing = nullptr;  // allocated by devlinkStart(): not while pairing needs the RAM
 static size_t devRingHead = 0, devRingLen = 0;  // guarded by devLock
 
 static void devQueue(const char *data, size_t n) {
-  if (devSock < 0 || !devLock || xSemaphoreTake(devLock, 0) != pdTRUE) return;
-  for (size_t i = 0; i < n && devRingLen < sizeof devRing; i++, devRingLen++)
-    devRing[(devRingHead + devRingLen) % sizeof devRing] = data[i];
+  if (devSock < 0 || !devRing || !devLock || xSemaphoreTake(devLock, 0) != pdTRUE) return;
+  for (size_t i = 0; i < n && devRingLen < DEV_RING; i++, devRingLen++)
+    devRing[(devRingHead + devRingLen) % DEV_RING] = data[i];
   xSemaphoreGive(devLock);
 }
 
@@ -71,7 +72,7 @@ static void devFlush() {
     xSemaphoreTake(devLock, portMAX_DELAY);
     while (n < sizeof out && devRingLen) {
       out[n++] = devRing[devRingHead];
-      devRingHead = (devRingHead + 1) % sizeof devRing;
+      devRingHead = (devRingHead + 1) % DEV_RING;
       devRingLen--;
     }
     xSemaphoreGive(devLock);
@@ -177,6 +178,7 @@ static int devHttpGetSmall(const char *path, char *buf, int size) {
 }
 
 static void (*devBeforeUpdate)() = nullptr;
+static bool (*devUpdateAllowed)() = nullptr;  // set by the sketch: false while pairing is in progress
 
 static const size_t OTA_MANIFEST_BODY = 48, OTA_MANIFEST_SIZE = 112;
 
@@ -354,6 +356,7 @@ static void devTask(void *) {
     // Don't update an unconfirmed image (a rollback would undo it anyway).
     if (!confirmed || millis() - lastCheck < DEVLINK_CHECK_MS) continue;
     lastCheck = millis();
+    if (devUpdateAllowed && !devUpdateAllowed()) continue;
     devCheckForUpdate();
   }
 }
@@ -410,8 +413,18 @@ static void devlinkBegin(void (*beforeUpdate)()) {
   devBeforeUpdate = beforeUpdate;
   devLock = xSemaphoreCreateMutex();
   devLoadHost();
-  // Even with no dev host, keep the rollback guard: confirms the image after a healthy minute.
   devOrigVprintf = esp_log_set_vprintf(devVprintf);
+}
+
+// The task (4 KB stack) and the log ring (2 KB) only start once the fan is paired and Bluetooth is released.
+// An unpaired fan has no WiFi, so there is nothing for the link to do, and pairing needs every KB: with
+// Bluetooth up, the WiFi driver crashed on a failed allocation when the controller sent the network.
+// The rollback guard lives in the task too: an image is confirmed after a healthy minute once paired.
+static void devlinkStart() {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  devRing = (char *)malloc(DEV_RING);
   xTaskCreate(devTask, "devlink", 4096, nullptr, 1, nullptr);
 }
 
